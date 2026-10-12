@@ -650,10 +650,12 @@ with gr.Blocks(title="Road damage reporter") as demo:
     auto_in.change(lambda on: gr.Timer(active=on), inputs=auto_in, outputs=timer)
 
 demo.queue(max_size=16)
-app = gr.mount_gradio_app(api, demo, path="/")
+# ssr_mode=False: on Hugging Face, server-side rendering would start a Node server
+# on port 7860 and block our own server from starting.
+app = gr.mount_gradio_app(api, demo, path="/", ssr_mode=False)
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
+    port = int(os.environ.get("PORT", os.environ.get("GRADIO_SERVER_PORT", "7860")))
     print(f"Open http://127.0.0.1:{port}  (dashcam page: http://127.0.0.1:{port}/dashcam)")
     uvicorn.run(app, host=os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0"), port=port)
