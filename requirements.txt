@@ -1,0 +1,9 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+ultralytics==8.3.108
+folium
+pandas
+pillow-heif
+onnx
+onnxscript

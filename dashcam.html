@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<title>Road Dashcam</title>
+<style>
+  :root {
+    --bg: #0b0f14; --panel: #131a22; --line: #24303c; --text: #e8edf2; --muted: #8a99a8;
+    --go: #ea580c; --stop: #b91c1c; --ok: #16a34a; --warn: #ca8a04; --bad: #dc2626;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { padding: 10px 12px calc(14px + env(safe-area-inset-bottom)); max-width: 1100px; margin: 0 auto; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+  h1 { font-size: 17px; margin: 0; letter-spacing: .2px; }
+  header a { color: var(--muted); font-size: 13px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  .chip { background: var(--panel); border: 1px solid var(--line); border-radius: 999px;
+    padding: 4px 10px; font-size: 13px; white-space: nowrap; }
+  .chip b { font-weight: 600; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px;
+    background: var(--muted); vertical-align: 1px; }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+  .stage { position: relative; width: 100%; background: #000; border-radius: 12px; overflow: hidden;
+    border: 1px solid var(--line); aspect-ratio: 16 / 9; max-height: 68vh; margin: 0 auto; }
+  .stage video, .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  .placeholder { position: absolute; inset: 0; display: grid; place-items: center; text-align: center;
+    color: var(--muted); padding: 20px; }
+  .flash { position: absolute; left: 50%; top: 12px; transform: translateX(-50%); background: var(--bad);
+    color: #fff; font-weight: 700; padding: 6px 14px; border-radius: 999px; opacity: 0; transition: opacity .2s; }
+  .flash.show { opacity: 1; }
+  .controls { display: flex; gap: 10px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
+  button#go { flex: 1 1 220px; border: 0; border-radius: 12px; padding: 16px; font-size: 18px; font-weight: 700;
+    color: #fff; background: var(--go); cursor: pointer; }
+  button#go.running { background: var(--stop); }
+  button#go:disabled { opacity: .5; }
+  label.conf { flex: 1 1 220px; color: var(--muted); font-size: 13px; }
+  label.conf input { width: 100%; }
+  .log { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 8px 12px;
+    max-height: 170px; overflow: auto; font-size: 13px; }
+  .log div { padding: 3px 0; border-bottom: 1px solid var(--line); }
+  .log div:last-child { border-bottom: 0; }
+  .muted { color: var(--muted); }
+  .tips { color: var(--muted); font-size: 13px; margin-top: 10px; }
+  .err { color: #fca5a5; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Road damage dashcam</h1>
+  <a href="./" target="_blank">Open dashboard</a>
+</header>
+
+<div class="chips">
+  <span class="chip"><span id="mDot" class="dot"></span>Model: <b id="mTxt">loading…</b></span>
+  <span class="chip"><span id="gDot" class="dot"></span>GPS: <b id="gTxt">off</b></span>
+  <span class="chip">Speed: <b id="spd">–</b></span>
+  <span class="chip">FPS: <b id="fps">–</b></span>
+  <span class="chip">Reported: <b id="sent">0</b></span>
+  <span class="chip">Waiting to send: <b id="queued">0</b></span>
+</div>
+
+<div class="stage" id="stage">
+  <video id="video" playsinline muted></video>
+  <canvas id="overlay"></canvas>
+  <div class="placeholder" id="ph">Mount the phone facing the road, then press Start.</div>
+  <div class="flash" id="flash">Reported</div>
+</div>
+
+<div class="controls">
+  <button id="go" disabled>Start</button>
+  <label class="conf">Confidence <b id="confV"></b>
+    <input id="conf" type="range" min="0.2" max="0.8" step="0.05">
+  </label>
+</div>
+
+<div class="log" id="log"><div class="muted">Detections that get reported will show here.</div></div>
+
+<p class="tips">
+  Keep this page open and the screen on. A damage is reported only when it shows up in 2 of 3 frames
+  and GPS is accurate to within <span id="gpsMax">60</span> m. The same damage is sent once per drive.
+  Only the location, damage type and time are sent, never video.
+  Do not touch the phone while driving.
+</p>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/ort.all.min.js"></script>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const video = $("video"), overlay = $("overlay"), octx = overlay.getContext("2d");
+  const COLORS = { pothole: "#ef4444", alligator_crack: "#f97316",
+                   transverse_crack: "#3b82f6", longitudinal_crack: "#22d3ee" };
+
+  let cfg = null, session = null, S = 640, names = [];
+  let running = false, stream = null, wakeLock = null, watchId = null;
+  let pos = null;                       // latest GPS fix
+  let history = [];                     // class sets of the last 3 frames
+  let reportedHere = [];                // {lat, lon, type} sent this drive
+  let sentCount = 0, lastPing = 0, frames = 0, fpsT = performance.now();
+  const driveId = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now());
+
+  const prep = document.createElement("canvas");
+  prep.width = prep.height = S;
+  const pctx = prep.getContext("2d", { willReadFrequently: true });
+
+  // ------------------------------------------------ queue (survives bad signal)
+  const QKEY = "dashcam-queue";
+  let queue = [];
+  try { queue = JSON.parse(localStorage.getItem(QKEY) || "[]"); } catch (e) { queue = []; }
+  const saveQueue = () => { try { localStorage.setItem(QKEY, JSON.stringify(queue)); } catch (e) {} ;
+                            $("queued").textContent = queue.length; };
+  saveQueue();
+
+  let flushing = false;
+  async function flush() {
+    if (flushing) return;
+    flushing = true;
+    try { await flushNow(); } finally { flushing = false; }
+  }
+  async function flushNow() {
+    while (queue.length) {
+      try {
+        const r = await fetch("api/report", { method: "POST", headers: { "Content-Type": "application/json" },
+                                              body: JSON.stringify(queue[0]) });
+        if (!r.ok && r.status !== 422) break;      // server problem: try later
+        const j = r.ok ? await r.json() : { status: "invalid" };
+        const item = queue.shift(); saveQueue();
+        if (j.status === "saved") { sentCount++; $("sent").textContent = sentCount; flash(); }
+        log(`${item.damage.map(d => d.type.replace("_", " ")).join(", ")} - ${j.status}`);
+      } catch (e) { break; }                       // offline: try later
+    }
+  }
+  setInterval(flush, 5000);
+
+  function log(msg) {
+    const box = $("log");
+    if (box.firstChild && box.firstChild.classList && box.firstChild.classList.contains("muted")) box.innerHTML = "";
+    const d = document.createElement("div");
+    d.textContent = `${new Date().toLocaleTimeString()}  ${msg}`;
+    box.prepend(d);
+    while (box.children.length > 40) box.lastChild.remove();
+  }
+  function flash() { const f = $("flash"); f.classList.add("show"); setTimeout(() => f.classList.remove("show"), 900); }
+
+  // ------------------------------------------------ setup
+  async function init() {
+    try {
+      cfg = await (await fetch("api/config")).json();
+      names = cfg.names; S = cfg.imgsz;
+      prep.width = prep.height = S;
+      $("conf").value = cfg.conf; $("confV").textContent = cfg.conf;
+      $("gpsMax").textContent = cfg.max_gps_error_m;
+      if (!cfg.model_ready) throw new Error("model file missing on the server");
+      ort.env.wasm.numThreads = 1;
+      const tryEP = async (eps) => ort.InferenceSession.create("model.onnx", { executionProviders: eps });
+      let ep = "wasm";
+      if (navigator.gpu) {
+        try { session = await tryEP(["webgpu"]); ep = "webgpu"; } catch (e) { session = null; }
+      }
+      if (!session) session = await tryEP(["wasm"]);
+      $("mTxt").textContent = `ready (${ep})`; $("mDot").className = "dot ok";
+      $("go").disabled = false;
+    } catch (e) {
+      $("mTxt").textContent = "failed"; $("mDot").className = "dot bad";
+      log("Model failed to load: " + e.message);
+    }
+  }
+  $("conf").addEventListener("input", (e) => { $("confV").textContent = e.target.value; });
+
+  // ------------------------------------------------ start / stop
+  $("go").addEventListener("click", () => running ? stop() : start());
+
+  async function start() {
+    if (!window.isSecureContext) { log("Camera and GPS need https. Open the hf.space link."); return; }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: false,
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } } });
+    } catch (e) { log("Camera blocked: " + e.message); return; }
+    video.srcObject = stream; await video.play();
+    $("ph").style.display = "none";
+    $("stage").style.aspectRatio = `${video.videoWidth || 16} / ${video.videoHeight || 9}`;
+    overlay.width = video.videoWidth; overlay.height = video.videoHeight;
+
+    if (navigator.geolocation) {
+      $("gTxt").textContent = "waiting…"; $("gDot").className = "dot warn";
+      watchId = navigator.geolocation.watchPosition(onPos, (e) => {
+        if (e.code === 1) { $("gTxt").textContent = "blocked"; $("gDot").className = "dot bad";
+                            log("Location permission denied. Allow it in the browser settings."); }
+      }, { enableHighAccuracy: true, maximumAge: 2000 });
+    }
+    try { wakeLock = await navigator.wakeLock?.request("screen"); } catch (e) {}
+    running = true; history = [];
+    $("go").textContent = "Stop"; $("go").classList.add("running");
+    log("Drive started");
+    loop();
+  }
+
+  function stop() {
+    running = false;
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+    try { wakeLock && wakeLock.release(); } catch (e) {}
+    watchId = null; stream = null; wakeLock = null;
+    octx.clearRect(0, 0, overlay.width, overlay.height);
+    $("go").textContent = "Start"; $("go").classList.remove("running");
+    $("gTxt").textContent = "off"; $("gDot").className = "dot";
+    log("Drive stopped");
+    flush();
+  }
+
+  document.addEventListener("visibilitychange", async () => {
+    if (running && document.visibilityState === "visible") {
+      try { wakeLock = await navigator.wakeLock?.request("screen"); } catch (e) {}
+    }
+  });
+
+  function onPos(p) {
+    pos = { lat: p.coords.latitude, lon: p.coords.longitude, acc: p.coords.accuracy,
+            speed: p.coords.speed, t: Date.now() };
+    const good = pos.acc <= cfg.max_gps_error_m;
+    $("gTxt").textContent = `±${Math.round(pos.acc)} m`;
+    $("gDot").className = "dot " + (good ? "ok" : "warn");
+    $("spd").textContent = pos.speed == null ? "–" : `${Math.round(pos.speed * 3.6)} km/h`;
+    if (Date.now() - lastPing > 10000) {
+      lastPing = Date.now();
+      fetch("api/ping", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session: driveId, lat: pos.lat, lon: pos.lon, accuracy: pos.acc,
+                               speed: pos.speed, sent: sentCount }) }).catch(() => {});
+    }
+  }
+
+  // ------------------------------------------------ detection
+  function preprocess() {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const scale = Math.min(S / vw, S / vh);
+    const nw = Math.round(vw * scale), nh = Math.round(vh * scale);
+    const dx = Math.floor((S - nw) / 2), dy = Math.floor((S - nh) / 2);
+    pctx.fillStyle = "rgb(114,114,114)"; pctx.fillRect(0, 0, S, S);
+    pctx.drawImage(video, dx, dy, nw, nh);
+    const px = pctx.getImageData(0, 0, S, S).data;
+    const n = S * S, input = new Float32Array(3 * n);
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      input[i] = px[j] / 255; input[i + n] = px[j + 1] / 255; input[i + 2 * n] = px[j + 2] / 255;
+    }
+    return { input, scale, dx, dy };
+  }
+
+  function iou(a, b) {
+    const x1 = Math.max(a.x1, b.x1), y1 = Math.max(a.y1, b.y1);
+    const x2 = Math.min(a.x2, b.x2), y2 = Math.min(a.y2, b.y2);
+    const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+    const u = (a.x2 - a.x1) * (a.y2 - a.y1) + (b.x2 - b.x1) * (b.y2 - b.y1) - inter;
+    return u > 0 ? inter / u : 0;
+  }
+
+  async function detect(conf) {
+    const { input, scale, dx, dy } = preprocess();
+    const feeds = { [session.inputNames[0]]: new ort.Tensor("float32", input, [1, 3, S, S]) };
+    const out = (await session.run(feeds))[session.outputNames[0]];
+    const [, ch, N] = out.dims, d = out.data, nc = ch - 4;
+    let boxes = [];
+    for (let i = 0; i < N; i++) {
+      let best = 0, cls = -1;
+      for (let k = 0; k < nc; k++) { const s = d[(4 + k) * N + i]; if (s > best) { best = s; cls = k; } }
+      if (best < conf) continue;
+      const cx = d[i], cy = d[N + i], w = d[2 * N + i], h = d[3 * N + i];
+      boxes.push({ cls, score: best,
+        x1: (cx - w / 2 - dx) / scale, y1: (cy - h / 2 - dy) / scale,
+        x2: (cx + w / 2 - dx) / scale, y2: (cy + h / 2 - dy) / scale });
+    }
+    boxes.sort((a, b) => b.score - a.score);
+    const keep = [];
+    for (const b of boxes) {
+      if (keep.length >= 50) break;
+      if (keep.every(k => k.cls !== b.cls || iou(k, b) < 0.45)) keep.push(b);
+    }
+    return keep.map(b => ({ ...b, type: names[b.cls] || `class_${b.cls}` }));
+  }
+
+  function draw(dets) {
+    octx.clearRect(0, 0, overlay.width, overlay.height);
+    const lw = Math.max(2, overlay.width / 320);
+    octx.lineWidth = lw; octx.font = `${Math.round(lw * 7)}px system-ui, sans-serif`;
+    for (const b of dets) {
+      const c = COLORS[b.type] || "#a3e635";
+      octx.strokeStyle = c; octx.strokeRect(b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1);
+      const label = `${b.type.replace("_", " ")} ${b.score.toFixed(2)}`;
+      const tw = octx.measureText(label).width + 8, th = lw * 9;
+      octx.fillStyle = c; octx.fillRect(b.x1, Math.max(0, b.y1 - th), tw, th);
+      octx.fillStyle = "#fff"; octx.fillText(label, b.x1 + 4, Math.max(th - lw * 2, b.y1 - lw * 2));
+    }
+  }
+
+  function handle(dets) {
+    // keep, per class, the best score in this frame
+    const frame = {};
+    for (const b of dets) frame[b.type] = Math.max(frame[b.type] || 0, b.score);
+    history.push(frame); if (history.length > 3) history.shift();
+
+    // confirmed = seen in at least 2 of the last 3 frames
+    const confirmed = {};
+    for (const t of Object.keys(frame)) {
+      const hits = history.filter(f => t in f).length;
+      if (hits >= 2) confirmed[t] = Math.max(...history.filter(f => t in f).map(f => f[t]));
+    }
+    const types = Object.keys(confirmed).filter(t => confirmed[t] >= cfg.min_report_conf);
+    if (!types.length) return;
+    if (!pos || Date.now() - pos.t > 10000 || pos.acc > cfg.max_gps_error_m) return;
+
+    const fresh = types.filter(t => !reportedHere.some(r => r.type === t &&
+                                    dist(r.lat, r.lon, pos.lat, pos.lon) <= cfg.same_drive_m));
+    if (!fresh.length) return;
+    fresh.forEach(t => reportedHere.push({ type: t, lat: pos.lat, lon: pos.lon }));
+    if (reportedHere.length > 500) reportedHere = reportedHere.slice(-500);
+
+    queue.push({ session: driveId, lat: pos.lat, lon: pos.lon, accuracy: pos.acc, speed: pos.speed,
+                 damage: fresh.map(t => ({ type: t, conf: +confirmed[t].toFixed(2) })) });
+    saveQueue(); flush();
+  }
+
+  function dist(a1, o1, a2, o2) {
+    const R = 6371000, p1 = a1 * Math.PI / 180, p2 = a2 * Math.PI / 180;
+    const dp = p2 - p1, dl = (o2 - o1) * Math.PI / 180;
+    const h = Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(h));
+  }
+
+  async function loop() {
+    if (!running) return;
+    try {
+      if (video.readyState >= 2 && video.videoWidth) {
+        if (overlay.width !== video.videoWidth) { overlay.width = video.videoWidth; overlay.height = video.videoHeight; }
+        const dets = await detect(parseFloat($("conf").value));
+        if (!running) return;
+        draw(dets); handle(dets);
+        frames++;
+        const now = performance.now();
+        if (now - fpsT > 1000) { $("fps").textContent = (frames * 1000 / (now - fpsT)).toFixed(1); frames = 0; fpsT = now; }
+      }
+    } catch (e) { log("Detection error: " + e.message); }
+    requestAnimationFrame(loop);
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>
