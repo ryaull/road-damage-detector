@@ -551,6 +551,17 @@ def live_report(rep: LiveReport):
     return {"status": "saved", "types": new}
 
 
+@api.get("/api/reports")
+def list_reports():
+    """Quick debug endpoint: see how many reports are stored and the latest ones."""
+    reports = store.all()
+    return {
+        "total": len(reports),
+        "latest": reports[-10:] if reports else [],
+        "storage": store.mode,
+    }
+
+
 # ---------------------------------------------------------------- UI
 GET_LOCATION_JS = """
 async (files, conf, use_loc, lat, lon) => {
