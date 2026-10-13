@@ -60,6 +60,7 @@
   <span class="chip">Speed: <b id="spd">–</b></span>
   <span class="chip">FPS: <b id="fps">–</b></span>
   <span class="chip">Reported: <b id="sent">0</b></span>
+  <span class="chip">Skipped: <b id="skip">0</b></span>
   <span class="chip">Waiting to send: <b id="queued">0</b></span>
 </div>
 
@@ -99,7 +100,7 @@
   let pos = null;                       // latest GPS fix
   let history = [];                     // class sets of the last 3 frames
   let reportedHere = [];                // {lat, lon, type} sent this drive
-  let sentCount = 0, lastPing = 0, frames = 0, fpsT = performance.now();
+  let sentCount = 0, skipCount = 0, lastPing = 0, frames = 0, fpsT = performance.now();
   const driveId = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now());
 
   const prep = document.createElement("canvas");
@@ -114,23 +115,18 @@
                             $("queued").textContent = queue.length; };
   saveQueue();
 
-  let flushing = false;
   async function flush() {
-    if (flushing) return;
-    flushing = true;
-    try { await flushNow(); } finally { flushing = false; }
-  }
-  async function flushNow() {
     while (queue.length) {
       try {
         const r = await fetch("api/report", { method: "POST", headers: { "Content-Type": "application/json" },
                                               body: JSON.stringify(queue[0]) });
-        if (!r.ok && r.status !== 422) break;      // server problem: try later
+        if (!r.ok && r.status !== 422) { log(`Server error ${r.status}, will retry`); break; }
         const j = r.ok ? await r.json() : { status: "invalid" };
         const item = queue.shift(); saveQueue();
         if (j.status === "saved") { sentCount++; $("sent").textContent = sentCount; flash(); }
-        log(`${item.damage.map(d => d.type.replace("_", " ")).join(", ")} - ${j.status}`);
-      } catch (e) { break; }                       // offline: try later
+        const label = item.damage.map(d => d.type.replace("_", " ")).join(", ");
+        log(`${label} → ${j.status}${j.reason ? " (" + j.reason + ")" : ""}`);
+      } catch (e) { log("Offline, will retry"); break; }
     }
   }
   setInterval(flush, 5000);
@@ -181,15 +177,15 @@
     } catch (e) { log("Camera blocked: " + e.message); return; }
     video.srcObject = stream; await video.play();
     $("ph").style.display = "none";
+    const ar = (video.videoWidth || 16) / (video.videoHeight || 9);
     $("stage").style.aspectRatio = `${video.videoWidth || 16} / ${video.videoHeight || 9}`;
     overlay.width = video.videoWidth; overlay.height = video.videoHeight;
 
     if (navigator.geolocation) {
       $("gTxt").textContent = "waiting…"; $("gDot").className = "dot warn";
       watchId = navigator.geolocation.watchPosition(onPos, (e) => {
-        if (e.code === 1) { $("gTxt").textContent = "blocked"; $("gDot").className = "dot bad";
-                            log("Location permission denied. Allow it in the browser settings."); }
-      }, { enableHighAccuracy: true, maximumAge: 2000 });
+        $("gTxt").textContent = "blocked"; $("gDot").className = "dot bad"; log("GPS: " + e.message);
+      }, { enableHighAccuracy: true, maximumAge: 2000, timeout: 20000 });
     }
     try { wakeLock = await navigator.wakeLock?.request("screen"); } catch (e) {}
     running = true; history = [];
@@ -294,6 +290,8 @@
     }
   }
 
+  function skip(reason) { skipCount++; $("skip").textContent = skipCount; log("⏭ " + reason); }
+
   function handle(dets) {
     // keep, per class, the best score in this frame
     const frame = {};
@@ -307,12 +305,24 @@
       if (hits >= 2) confirmed[t] = Math.max(...history.filter(f => t in f).map(f => f[t]));
     }
     const types = Object.keys(confirmed).filter(t => confirmed[t] >= cfg.min_report_conf);
-    if (!types.length) return;
-    if (!pos || Date.now() - pos.t > 10000 || pos.acc > cfg.max_gps_error_m) return;
+    if (!types.length) {
+      if (Object.keys(frame).length) {
+        const reasons = [];
+        const unconfirmed = Object.keys(frame).filter(t => !(t in confirmed));
+        const weak = Object.keys(confirmed).filter(t => confirmed[t] < cfg.min_report_conf);
+        if (unconfirmed.length) reasons.push(unconfirmed.map(t => t.replace("_", " ")).join(", ") + " seen once (need 2 of 3 frames)");
+        if (weak.length) reasons.push(weak.map(t => t.replace("_", " ")).join(", ") + " too low confidence");
+        if (reasons.length) skip(reasons.join("; "));
+      }
+      return;
+    }
+    if (!pos) { skip(types.map(t => t.replace("_", " ")).join(", ") + " — no GPS fix yet"); return; }
+    if (Date.now() - pos.t > 10000) { skip(types.map(t => t.replace("_", " ")).join(", ") + " — GPS stale (>" + Math.round((Date.now() - pos.t)/1000) + "s old)"); return; }
+    if (pos.acc > cfg.max_gps_error_m) { skip(types.map(t => t.replace("_", " ")).join(", ") + " — GPS too weak (±" + Math.round(pos.acc) + "m, need <" + cfg.max_gps_error_m + "m)"); return; }
 
     const fresh = types.filter(t => !reportedHere.some(r => r.type === t &&
                                     dist(r.lat, r.lon, pos.lat, pos.lon) <= cfg.same_drive_m));
-    if (!fresh.length) return;
+    if (!fresh.length) return;  // dedup: already reported this spot, that's normal
     fresh.forEach(t => reportedHere.push({ type: t, lat: pos.lat, lon: pos.lon }));
     if (reportedHere.length > 500) reportedHere = reportedHere.slice(-500);
 
